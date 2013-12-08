@@ -20,7 +20,7 @@ trait TwitterAuthorization {
 trait OAuthTwitterAuthorization extends TwitterAuthorization {
   import OAuth._
   val home = System.getProperty("user.home")
-  val lines = Source.fromFile(s"$home/.twitter/scalaexchange2013").getLines().toList
+  val lines = Source.fromFile(s"$home/.twitter/activator").getLines().toList
 
   val consumer = Consumer(lines(0), lines(1))
   val token = Token(lines(2), lines(3))
