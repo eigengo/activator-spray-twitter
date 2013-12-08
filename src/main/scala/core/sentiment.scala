@@ -80,20 +80,25 @@ trait AnsiConsoleSentimentOutput extends SentimentOutput {
 
 class SentimentAnalysisActor extends Actor {
   this: SentimentSets with SentimentOutput =>
+  import collection._
 
-  private val counts = collection.mutable.Map[Category, Int]()
-  private val languages = collection.mutable.Map[Category, Int]()
-  private val places = collection.mutable.Map[Category, Int]()
+  private val counts = mutable.Map[Category, Int]()
+  private val languages = mutable.Map[Category, Int]()
+  private val places = mutable.Map[Category, Int]()
 
-  private def update(data: collection.mutable.Map[Category, Int])(category: Category, delta: Int): Unit = data.put(category, data.getOrElse(category, 0) + delta)
+  private def update(data: mutable.Map[Category, Int])
+                    (category: Category, delta: Int): Unit =
+    data.put(category, data.getOrElse(category, 0) + delta)
+
   val updateCounts = update(counts)_
   val updateLanguages = update(languages)_
   val updatePlaces = update(places)_
 
   def receive: Receive = {
     case tweet: Tweet =>
-      val positive: Int = if (positiveWords.exists(word => tweet.text.toLowerCase contains word)) 1 else 0
-      val negative: Int = if (negativeWords.exists(word => tweet.text.toLowerCase contains word)) 1 else 0
+      val text = tweet.text.toLowerCase
+      val positive: Int = if (positiveWords.exists(text contains)) 1 else 0
+      val negative: Int = if (negativeWords.exists(text contains)) 1 else 0
 
       updateCounts("positive", positive)
       updateCounts("negative", negative)

@@ -345,7 +345,7 @@ class TweetStreamerActorSpec extends TestKit(ActorSystem()) with SpecificationLi
 ```
 
 I must implement the ``authorize`` member, which returns ``HttpRequest => HttpRequest`` function. But for tests,
-the returned function makes no changes to its parameter; it is therefore the ``identity`` function.
+the returned function returns the value it is given; it is therefore the ``identity`` function.
 
 In the app, I mix in the ``OAuthTwitterAuthorization`` trait when constructing the ``TweetStreamerActor``.
 
@@ -366,4 +366,145 @@ I now have code that successfully streams the tweets from Twitter's streaming AP
 last component I need is the sentiment analysis.
 
 #Sentiment analysis
-The sentiment analysis receives the ``Tweet`` instances and should
+The sentiment analysis receives the ``Tweet`` instances and should analyse the tweets. To perform the analysis, I
+will need sets of positive and negative words; and a way to display the output. I would also like to have some
+flexibility in constructing the sentiment analyzer. And so, I arrive at:
+
+```scala
+trait SentimentSets {
+  def positiveWords: Set[String]
+  def negativeWords: Set[String]
+}
+
+trait SentimentOutput {
+  type Category = String
+
+  def outputCount(values: List[Iterable[(Category, Int)]]): Unit
+}
+```
+
+And require the ``SentimentAnalysisActor`` to be instantiated with the appropriate implementations of the
+``SentimentSets`` and ``SentimentOutput``.
+
+```scala
+class SentimentAnalysisActor extends Actor {
+  this: SentimentSets with SentimentOutput =>
+
+  ...
+}
+```
+
+When the ``SentimentAnalysisActor`` receives a ``Tweet``, it finds out if its text is in the ``positiveWords`` or
+``negativeWords``, incrementing the counts of _positive_ and _negative_ tweets, respectively. It also keeps track of
+counts of tweets depending on the tweet's place and language. Without further ado, the entire ``SentimentAnalysisActor``
+is just:
+
+```scala
+class SentimentAnalysisActor extends Actor {
+  this: SentimentSets with SentimentOutput =>
+  import collection._
+
+  private val counts = mutable.Map[Category, Int]()
+  private val languages = mutable.Map[Category, Int]()
+  private val places = mutable.Map[Category, Int]()
+
+  private def update(data: mutable.Map[Category, Int])
+                    (category: Category, delta: Int): Unit =
+    data.put(category, data.getOrElse(category, 0) + delta)
+
+  val updateCounts = update(counts)_
+  val updateLanguages = update(languages)_
+  val updatePlaces = update(places)_
+
+  def receive: Receive = {
+    case tweet: Tweet =>
+      val text = tweet.text.toLowerCase
+      val positive = if (positiveWords.exists(text contains)) 1 else 0
+      val negative = if (negativeWords.exists(text contains)) 1 else 0
+
+      updateCounts("positive", positive)
+      updateCounts("negative", negative)
+      if (tweet.user.followersCount > 200) {
+        updateCounts("positive.gurus", positive)
+        updateCounts("negative.gurus", negative)
+      }
+      updateCounts("all", 1)
+      updateLanguages(tweet.user.lang, 1)
+      updatePlaces(tweet.place.toString, 1)
+
+      outputCount(List(counts, places, languages))
+  }
+}
+```
+
+There is one implementation of the ``SentimentSets``: the ``CSVLoadedSentimentSets``, which loads the sentiment sets
+from CSV files on the classpath; there is also one implementation of the ``SentimentOutput``, which displays the output
+on the ANSI terminal.
+
+The "proper" instantiation of the ``SentimentAnalysisActor`` in the app becomes:
+
+```scala
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor with CSVLoadedSentimentSets with AnsiConsoleSentimentOutput))
+  val stream = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment) with OAuthTwitterAuthorization))
+
+  ...
+}
+```
+
+#The app
+Now that we have all the required code, we can create the app that you can run. It runs a simple command loop that
+reads the standard input, interprets the commands you type in, and then send the messages to the ``TweetStreamerActor``.
+
+```scala
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor with CSVLoadedSentimentSets with AnsiConsoleSentimentOutput))
+  val stream = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment) with OAuthTwitterAuthorization))
+
+  @tailrec
+  private def commandLoop(): Unit = {
+    Console.readLine() match {
+      case QuitCommand         => return
+      case TrackCommand(query) => stream ! query
+      case _                   => println("WTF??!!")
+    }
+
+    commandLoop()
+  }
+
+  commandLoop()
+  system.shutdown()
+}
+
+object Commands {
+
+  val QuitCommand   = "quit"
+  val TrackCommand = "track (.*)".r
+
+}
+```
+
+Before you run the application, remember to create the ``~/.twitter/activator`` file, containing four lines;
+these lines represent your twitter consumer key and secret, followed by token value and token secret.
+To generate these values, head over to [https://dev.twitter.com/apps/](https://dev.twitter.com/apps/), create an
+application and add the appropriate lines to this file. An example ``~/.twitter/activator`` is
+
+```
+*************TqOdlxA
+****************************Fv9b1ELexCRhI
+********-*************************GUjmnWQvZ5GwnBR2
+***********************************ybgUNqrZwD
+```
+
+Naturally, the you will need to replace the ``*``s with the values in your consumer token and secret; and token
+value and secret.
+
+Having added the file above, you can see the application "in action", by run ``sbt run`` in an ANSI terminal.
+Once running, type in ``track christmas``, ``track daley``, or anything else that tickles your fancy and rejoice
+in the humanity's collective wisdom.
