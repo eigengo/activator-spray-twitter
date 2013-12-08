@@ -505,6 +505,6 @@ application and add the appropriate lines to this file. An example ``~/.twitter/
 Naturally, the you will need to replace the ``*``s with the values in your consumer token and secret; and token
 value and secret.
 
-Having added the file above, you can see the application "in action", by run ``sbt run`` in an ANSI terminal.
+Having added the file above, you can see the application "in action", by running ``sbt run`` in an ANSI terminal.
 Once running, type in ``track christmas``, ``track daley``, or anything else that tickles your fancy and rejoice
 in the humanity's collective wisdom.
