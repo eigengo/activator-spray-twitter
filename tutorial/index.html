@@ -1,0 +1,398 @@
+<html>
+<head>
+    <title>Spray client and tweets</title>
+</head>
+<body>
+<div>
+<h2>Spray client and tweets</h2>
+<p>In this tutorial, I am going to use the Spray Client, Akka IO and core Akka to build an application that streams tweets and then performs trivial analysis of the received data. It shows you how to build a simple Akka application with just a few actors, how to use Akka IO to make HTTP requests, how to wire in OAuth, and how to deal with streaming input. It also demonstrates approaches to testing of such applications.</p>
+<p>It should allow us to track specific Twitter topics, and analyse the received tweets</p>
+<p><img src="tutorial/sentiment.png" title="Sentiment analysis"/></p>
+<p>Let's begin by showing the overall structure of the code we're building.</p>
+<p><img src="tutorial/overall.png" title="Overall structure"/></p>
+<p>The components in blue are actors, the components in orange are traits; and we shall be providing some interesting implementations of those traits.</p>
+</div>
+<div>
+<h2>The core</h2>
+<p>I begin by constructing the core of our system. It contains two actors one that deals with the HTTP connection to Twitter, and one that deals with processing of the tweets as they arrive. In code, they are the <code>TweetStreamerActor</code>, and <code>SentimentAnalysisActor</code>. The <code>TweetStreamerActor</code> needs the URI to connect to and the reference to the actor that is going to perform the sentiment analysis. Thus, we arrive at</p>
+<code><pre>
+object TweetStreamerActor {
+  val twitterUri = Uri("https://stream.twitter.com/1.1/statuses/filter.json")
+}
+
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor {
+  ...
+}
+
+class SentimentAnalysisActor extends Actor {
+  ...
+}
+</pre></code>
+<p>For our convenience, I included the <code>TweetStreamerActor</code> companion object, which contains the uri to Twitter's streaming API. To construct our application, all we need to do is to instantiate the actors in the right sequence</p>
+<code><pre>
+object Main extends App {
+  import Commands._
+
+  val system    = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor))
+  val stream    = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment)))
+  ...
+}
+</pre></code>
+</div>
+<div>
+<h2>Streaming the tweets</h2>
+<p>Next up, let's write the core of the <code>TweetStreamerActor</code> We construct the Akka IO, and then construct the appropriate <code>HttpRequest</code> that we send to the given <code>uri</code>.</p>
+<code><pre>
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor {
+  val io = IO(Http)(context.system)
+
+  def receive: Receive = {
+    case query: String =>
+      val body = HttpEntity(ContentType(MediaTypes.`application/x-www-form-urlencoded`), s"track=$query")
+      val rq = HttpRequest(HttpMethods.POST, uri = uri, entity = body)
+      sendTo(io).withResponsesReceivedBy(self)(rq)
+    case MessageChunk(entity, _) =>
+    case _ =>
+  }
+}
+</pre></code>
+<p>Dissecting the <code>TweetStreamerActor</code>, we first get the reference (an <code>ActorRef</code> no less) to the HTTP manager by calling <code>IO(Http)(system.context)</code>. This actor is responsible for dealing with all HTTP communication; in our case, we'll be sending the <code>HttpRequest</code>s to it.</p>
+<p>And that's precisely what we do in the <code>receive</code> function. When the <code>query: String</code> message arrives, we construct the HTTP request and then call <code>sendTo(io).withResponsesReceivedBy(self)(rq)</code>, which--in human speak--means <em>take the IO actor (sendTo(io)), have it send all received responses to this actor (withResponsesReceivedBy(self)), and apply the request to it (rq)</em>. And so, Spray client is going to send the responses to the request to this actor, which means that we have to handle <code>ChunkedResponseStart</code>, <code>MessageChunk</code>, and many other HTTP messages. However, the only HTTP layer message we're really interested in is the <code>MessageChunk</code>, whose <code>entity</code> contains the JSON that represents each tweet.</p>
+<p>Being strongly-typed, we would like to deal with our own types, not JSON <code>String</code>s. And so, we must implement an unmarshaller that can turn the entity into an instance of <code>Tweet</code>. To do that, we'll use Spray JSON module, and define an instance of the <code>Unmarshaller</code> typeclass for the type <code>Tweet</code>.</p>
+<code><pre>
+trait TweetMarshaller {
+
+  implicit object TweetUnmarshaller extends Unmarshaller[Tweet] {
+    def apply(entity: HttpEntity): Deserialized[Tweet] = {
+      ???
+    }
+  }
+}
+</pre></code>
+<p>I will not show all the boring JSON gymnastics; instead, I'll just outline the main points. Our typeclass instance must implement the <code>apply(HttpEntity): Deserialized[Tweet]</code> method; <code>Deserialized[A]</code> is a type alias for <code>Either[DeserializationError, T]</code>.</p>
+<code><pre>
+trait TweetMarshaller {
+
+  implicit object TweetUnmarshaller extends Unmarshaller[Tweet] {
+
+    def mkUser(user: JsObject): Deserialized[User] = ...
+
+    def mkPlace(place: JsValue): Deserialized[Option[Place]] = ...
+
+    def apply(entity: HttpEntity): Deserialized[Tweet] = {
+      Try {
+        val json = JsonParser(entity.asString).asJsObject
+        (json.fields.get("id_str"), json.fields.get("text"), json.fields.get("place"), json.fields.get("user")) match {
+          case (Some(JsString(id)), Some(JsString(text)), Some(place), Some(user: JsObject)) =>
+            val x = mkUser(user).fold(x => Left(x), { user =>
+              mkPlace(place).fold(x => Left(x), { place =>
+                Right(Tweet(id, user, text, place))
+              })
+            })
+            x
+          case _ => Left(MalformedContent("bad tweet"))
+        }
+      }
+    }.getOrElse(Left(MalformedContent("bad json")))
+  }
+}
+</pre></code>
+<p>Folding the instances of <code>Deserialized[_]</code>, we arrive at code that can (safely) turn a JSON that may represent a tweet into an instance of <code>Tweet</code>. Let's now wire add the <code>TweetMarshaller</code> to our <code>TweetStreamerActor</code> and use it when dealing with the <code>MessageChunk</code> message.</p>
+<code><pre>
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with TweetMarshaller {
+
+  def receive: Receive = {
+    ...
+    case MessageChunk(entity, _) => TweetUnmarshaller(entity).fold(_ => (), processor !)
+    case _ =>
+  }
+}
+</pre></code>
+<p>Notice that I've mixed in the <code>TweetMarshaller</code> to the actor using the <code>with</code> keyword. This give me access to the <code>TweetUnmarshaller</code> typeclass instance, and I call its <code>apply</code> method to the received <code>entity</code>. It then gives me <code>Deserialized[Tweet]</code>, fold the result into <code>()</code> by "ignoring" the values on the <code>Left</code>s and by sending the values on the <code>Right</code> to the <code>processor</code>. This is a terse way of writing the usual pattern match</p>
+<code><pre>
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with TweetMarshaller {
+
+  def receive: Receive = {
+    ...
+    case MessageChunk(entity, _) =>
+      TweetUnmarshaller(entity) match {
+        case Right(tweet) => processor ! tweet
+        case _            =>
+      }
+  }
+}
+</pre></code>
+<p>Onwards. Let's see if our code runs as expected by writing a test; a test that constructs the HTTP server that serves the tweet responses like the real Twitter API, and by using the <code>TweetStreamerActor</code> to check that it can deal with the received responses. The test, in its entirety fits on just a few lines of code</p>
+<code><pre>
+class TweetStreamerActorSpec extends TestKit(ActorSystem()) with SpecificationLike with ImplicitSender {
+  sequential
+
+  val port = 12345
+  val tweetStream = TestActorRef(
+    new TweetStreamerActor(Uri(s"http://localhost:$port/"), testActor))
+
+  "Streaming tweets" >> {
+
+    "Should unmarshal one tweet" in {
+      val twitterApi = TwitterApi(port)
+      tweetStream ! "quux"  // our TwitterApi does not care
+
+      val tweet = expectMsgType[Tweet]
+      tweet.text mustEqual "Aggressive Ponytail #freebandnames"
+      tweet.user.lang mustEqual "en"
+      tweet.user.id mustEqual "137238150"
+      tweet.place mustEqual None
+      twitterApi.stop()
+      success
+    }
+  }
+
+}
+</pre></code>
+<p>Notice how I make the most of Akka's TestKit and use the <code>testActorRef</code> as the <code>processor</code> parameter of the <code>TweetStreamerActor</code>. This allows me to examine the received responses--viz the line <code>expectMsgType[Tweet]</code>. Before we move on to the real Twitter API, I will show the implementation of the <code>TwitterApi</code> our test-only HTTP server that simulates the Twitter API.</p>
+<code><pre>
+class TwitterApi private(system: ActorSystem, port: Int, body: String) {
+
+  private class Service extends Actor {
+
+    def receive: Receive = {
+      case _: Http.Connected =>
+        sender ! Http.Register(self)
+      case HttpRequest(HttpMethods.POST, _, _, _, _) =>
+        sender ! ChunkedResponseStart(HttpResponse(StatusCodes.OK))
+        sender ! MessageChunk(body = body)
+        sender ! ChunkedMessageEnd()
+    }
+  }
+
+  val service = system.actorOf(Props(new Service))
+  val io = IO(Http)(system)
+  io ! Http.Bind(service, "localhost", port = port)
+
+  def stop(): Unit = {
+    io ! Http.Unbind
+    system.stop(service)
+    system.stop(io)
+  }
+}
+
+object TwitterApi {
+
+  def apply(port: Int)(implicit system: ActorSystem): TwitterApi = {
+    val body = Source.fromInputStream(getClass.getResourceAsStream("/tweet.json")).mkString
+    new TwitterApi(system, port, body)
+  }
+
+}
+</pre></code>
+<p>It too uses the Akka IO's Http extension, but this time, to bind the <code>Service</code> to the <code>localhost</code> interface on the given <code>port</code>. Whenever a client connects (by sending the <code>Http.Connected</code> message), I register the same actor to handle the requests from that client by replying with <code>Http.Register(self)</code>. (This means that our <code>Service</code> is a singleton handler all clients are handled by the same actor.) Because I have registered <code>self</code> to be the handler for all client connections, I must react to the <code>HttpRequest</code> messages the clients send. In my case, I respond to every HTTP POST by chunking the content of the <code>/tweet.json</code> resource.</p>
+</div>
+<div>
+<h2>OAuth</h2>
+<p>Before I can move on to the <em>big data</em> code, I must deal with the authorization that Twitter requires. Twitter requires OAuth authorization of all requests. Most trivially, this means adding the <code>Authorization</code> HTTP header with properly constructed value. To put it even another way, to authorize a <code>HttpRequest</code> is to take the original request and return a new <code>HttpRequest</code> that includes the appropriate header. To do so in the context of OAuth, I also need to know the consumer token and secret and the token key and secret. And this is enough to allow me to give the outline in Scala</p>
+<code><pre>
+object OAuth {
+  case class Consumer(key: String, secret: String)
+  case class Token(value: String, secret: String)
+
+  def oAuthAuthorizer(consumer: Consumer, token: Token): HttpRequest => HttpRequest = {
+    // magic
+    ???
+  }
+}
+</pre></code>
+<p>The shape of the code above matches what I said above to OAuth-authorize a HttpRequest, I need to know the details of the <em>consumer</em> and <em>token</em>; and the authorization process takes an unauthorized <code>HttpRequest</code> and adds the required authorization to it.</p>
+<p>I can now add the OAuth authorization to the <code>TweetStreamerActor</code>. However, instead of just "hard coding" it in, I will define a few traits that will allow me to control the instances of the <code>TweetStreamerActor</code>s. I define</p>
+<code><pre>
+trait TwitterAuthorization {
+  def authorize: HttpRequest => HttpRequest
+}
+</pre></code>
+<p>And then require that the instances of the <code>TweetStreamerActor</code> be instantiated with the appropriate implementation of the <code>TwitterAuthorization</code>. In other words, the Cake pattern with self-type annotations.</p>
+<code><pre>
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with TweetMarshaller {
+  this: TwitterAuthorization =>
+
+  ...
+}
+</pre></code>
+<p>I also provide an implementation of the <code>TwitterAuthorization</code> that uses the OAuth machinery, and loads the consumer and token details from a file. (So that you don't include the authorization details in your code.)</p>
+<code><pre>
+trait OAuthTwitterAuthorization extends TwitterAuthorization {
+  import OAuth._
+  val home = System.getProperty("user.home")
+  val lines = Source.fromFile(s"$home/.twitter/activator").getLines().toList
+
+  val consumer = Consumer(lines(0), lines(1))
+  val token = Token(lines(2), lines(3))
+
+  val authorize: (HttpRequest) => HttpRequest = oAuthAuthorizer(consumer, token)
+}
+</pre></code>
+<p>Notice in particular that I satisfy the <code>def authorize: HttpRequest => HttpRequest</code> by having the field <code>authorize</code>, whose value is computed by applying the <code>oAuthAuthorizer</code> to the consumer and token. Finally, I must actually apply the authorization to the <code>HttpRequest</code>s I send out in the <code>TweetStreamerActor</code>. Nothing could be simpler. I just add <code>~> authorize</code> to the <code>HttpRequest</code> I create when handling the <code>query: String</code> message.</p>
+<code><pre>
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with TweetMarshaller {
+  this: TwitterAuthorization =>
+  ...
+
+  def receive: Receive = {
+    case query: String =>
+      val body = HttpEntity(ContentType(MediaTypes.`application/x-www-form-urlencoded`), s"track=$query")
+      val rq = HttpRequest(HttpMethods.POST, uri = uri, entity = body) ~> authorize
+      sendTo(io).withResponsesReceivedBy(self)(rq)
+    ...
+  }
+}
+</pre></code>
+<p>To complete, I need to modify the test and the app to satisfy the self-type annotation. The test does not actually require any authorization</p>
+<code><pre>
+class TweetStreamerActorSpec extends TestKit(ActorSystem()) with SpecificationLike with ImplicitSender {
+  sequential
+
+  val port = 12345
+  val tweetStream = TestActorRef(
+    new TweetStreamerActor(Uri(s"http://localhost:$port/"), testActor)
+    with TwitterAuthorization {
+      def authorize = identity
+    })
+
+  ...
+}
+</pre></code>
+<p>I must implement the <code>authorize</code> member, which returns <code>HttpRequest => HttpRequest</code> function. But for tests, the returned function returns the value it is given; it is therefore the <code>identity</code> function.</p>
+<p>In the app, I mix in the <code>OAuthTwitterAuthorization</code> trait when constructing the <code>TweetStreamerActor</code>.</p>
+<code><pre>
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor))
+  val stream = system.actorOf(Props(
+    new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment)
+    with OAuthTwitterAuthorization))
+  ...
+}
+</pre></code>
+<p>I now have code that successfully streams the tweets from Twitter's streaming API, I have OAuth authorization; the last component I need is the sentiment analysis.</p>
+</div>
+<div>
+<h2>Sentiment analysis</h2>
+<p>The sentiment analysis receives the <code>Tweet</code> instances and should analyse the tweets. To perform the analysis, I will need sets of positive and negative words; and a way to display the output. I would also like to have some flexibility in constructing the sentiment analyzer. And so, I arrive at</p>
+<code><pre>
+trait SentimentSets {
+  def positiveWords: Set[String]
+  def negativeWords: Set[String]
+}
+
+trait SentimentOutput {
+  type Category = String
+
+  def outputCount(values: List[Iterable[(Category, Int)]]): Unit
+}
+</pre></code>
+<p>And require the <code>SentimentAnalysisActor</code> to be instantiated with the appropriate implementations of the <code>SentimentSets</code> and <code>SentimentOutput</code>.</p>
+<code><pre>
+class SentimentAnalysisActor extends Actor {
+  this: SentimentSets with SentimentOutput =>
+
+  ...
+}
+</pre></code>
+<p>When the <code>SentimentAnalysisActor</code> receives a <code>Tweet</code>, it finds out if its text is in the <code>positiveWords</code> or <code>negativeWords</code>, incrementing the counts of <em>positive</em> and <em>negative</em> tweets, respectively. It also keeps track of counts of tweets depending on the tweet's place and language. Without further ado, the entire <code>SentimentAnalysisActor</code> is just</p>
+<code><pre>
+class SentimentAnalysisActor extends Actor {
+  this: SentimentSets with SentimentOutput =>
+  import collection._
+
+  private val counts = mutable.Map[Category, Int]()
+  private val languages = mutable.Map[Category, Int]()
+  private val places = mutable.Map[Category, Int]()
+
+  private def update(data: mutable.Map[Category, Int])
+                    (category: Category, delta: Int): Unit =
+    data.put(category, data.getOrElse(category, 0) + delta)
+
+  val updateCounts = update(counts)_
+  val updateLanguages = update(languages)_
+  val updatePlaces = update(places)_
+
+  def receive: Receive = {
+    case tweet: Tweet =>
+      val text = tweet.text.toLowerCase
+      val positive = if (positiveWords.exists(text contains)) 1 else 0
+      val negative = if (negativeWords.exists(text contains)) 1 else 0
+
+      updateCounts("positive", positive)
+      updateCounts("negative", negative)
+      if (tweet.user.followersCount > 200) {
+        updateCounts("positive.gurus", positive)
+        updateCounts("negative.gurus", negative)
+      }
+      updateCounts("all", 1)
+      updateLanguages(tweet.user.lang, 1)
+      updatePlaces(tweet.place.toString, 1)
+
+      outputCount(List(counts, places, languages))
+  }
+}
+</pre></code>
+<p>There is one implementation of the <code>SentimentSets</code> the <code>CSVLoadedSentimentSets</code>, which loads the sentiment sets from CSV files on the classpath; there is also one implementation of the <code>SentimentOutput</code>, which displays the output on the ANSI terminal.</p>
+<p>The "proper" instantiation of the <code>SentimentAnalysisActor</code> in the app becomes</p>
+<code><pre>
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor with CSVLoadedSentimentSets with AnsiConsoleSentimentOutput))
+  val stream = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment) with OAuthTwitterAuthorization))
+
+  ...
+}
+</pre></code>
+</div>
+<div>
+<h2>The app</h2>
+<p>Now that we have all the required code, we can create the app that you can run. It runs a simple command loop that reads the standard input, interprets the commands you type in, and then send the messages to the <code>TweetStreamerActor</code>.</p>
+<code><pre>
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor with CSVLoadedSentimentSets with AnsiConsoleSentimentOutput))
+  val stream = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment) with OAuthTwitterAuthorization))
+
+  @tailrec
+  private def commandLoop(): Unit = {
+    Console.readLine() match {
+      case QuitCommand         => return
+      case TrackCommand(query) => stream ! query
+      case _                   => println("WTF??!!")
+    }
+
+    commandLoop()
+  }
+
+  commandLoop()
+  system.shutdown()
+}
+
+object Commands {
+
+  val QuitCommand   = "quit"
+  val TrackCommand = "track (.*)".r
+
+}
+</pre></code>
+<p>Before you run the application, remember to create the <code>~/.twitter/activator</code> file, containing four lines; these lines represent your twitter consumer key and secret, followed by token value and token secret. To generate these values, head over to <a href="https://dev.twitter.com/apps/" target="_blank">https//dev.twitter.com/apps/</a>, create an application and add the appropriate lines to this file. An example <code>~/.twitter/activator</code> is</p>
+<code><pre>
+*************TqOdlxA
+****************************Fv9b1ELexCRhI
+********-*************************GUjmnWQvZ5GwnBR2
+***********************************ybgUNqrZwD
+</pre></code>
+<p>Naturally, the you will need to replace the <code>*</code>s with the values in your consumer token and secret; and token value and secret.</p>
+<p>Having added the file above, you can see the application "in action", by running <code>sbt run</code> in an ANSI terminal. Once running, type in <code>track christmas</code>, <code>track daley</code>, or anything else that tickles your fancy and rejoice in the humanity's collective wisdom.</p>
+</div>
+</body>
+</html>
