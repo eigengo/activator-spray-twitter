@@ -7,7 +7,7 @@ It shows you how to build a simple Akka application with just a few actors, how 
 requests, how to wire in OAuth, and how to deal with streaming input. It also demonstrates approaches to testing of
 such applications.
 
-It should allow us to track specific Twitter topics, and analyse the received tweets:
+It should allow us to track specific Twitter topics, and analyse the received tweets, giving the following output:
 
 ![Sentiment analysis](tutorial/sentiment.png)
 
