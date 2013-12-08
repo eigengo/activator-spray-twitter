@@ -7,6 +7,10 @@ It shows you how to build a simple Akka application with just a few actors, how 
 requests, how to wire in OAuth, and how to deal with streaming input. It also demonstrates approaches to testing of
 such applications.
 
+It should allow us to track specific Twitter topics, and analyse the received tweets:
+
+![Sentiment analysis](tutorial/sentiment.png)
+
 Let's begin by showing the overall structure of the code we're building.
 
 ![Overall structure](tutorial/overall.png)
@@ -38,9 +42,14 @@ For our convenience, I included the ``TweetStreamerActor`` companion object, whi
 streaming API. To construct our application, all we need to do is to instantiate the actors in the right sequence:
 
 ```scala
-val system    = ActorSystem()
-val sentiment = system.actorOf(Props(new SentimentAnalysisActor))
-val stream    = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment)))
+object Main extends App {
+  import Commands._
+
+  val system    = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor))
+  val stream    = system.actorOf(Props(new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment)))
+  ...
+}
 ```
 
 ---
@@ -238,7 +247,7 @@ to be the handler for all client connections, I must react to the ``HttpRequest`
 In my case, I respond to every HTTP POST by chunking the content of the ``/tweet.json`` resource.
 
 ##OAuth
-Before I can move on to the _big data_ code, I must deal with the authentication that Twitter requires. Twitter
+Before I can move on to the _big data_ code, I must deal with the authorization that Twitter requires. Twitter
 requires OAuth authorization of all requests. Most trivially, this means adding the ``Authorization`` HTTP header
 with properly constructed value. To put it even another way, to authorize a ``HttpRequest`` is to take the original
 request and return a new ``HttpRequest`` that includes the appropriate header. To do so in the context of OAuth,
@@ -258,7 +267,7 @@ object OAuth {
 ```
 
 The shape of the code above matches what I said above: to OAuth-authorize a HttpRequest, I need to know the details of
-the _consumer_ and _token_; and the authroization process takes an unauthorized ``HttpRequest`` and adds the
+the _consumer_ and _token_; and the authorization process takes an unauthorized ``HttpRequest`` and adds the
 required authorization to it.
 
 I can now add the OAuth authorization to the ``TweetStreamerActor``. However, instead of just "hard coding" it in,
@@ -282,7 +291,7 @@ class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with Tweet
 ```
 
 I also provide an implementation of the ``TwitterAuthorization`` that uses the OAuth machinery, and loads the
-consumer and token details from a file. (So that you don't include the authentication details in your code.)
+consumer and token details from a file. (So that you don't include the authorization details in your code.)
 
 ```scala
 trait OAuthTwitterAuthorization extends TwitterAuthorization {
@@ -298,5 +307,63 @@ trait OAuthTwitterAuthorization extends TwitterAuthorization {
 ```
 
 Notice in particular that I satisfy the ``def authorize: HttpRequest => HttpRequest`` by having the field
-``authorize``, whose value is computed by applying the ``oAuthAuthorizer`` to the consumer and token.
+``authorize``, whose value is computed by applying the ``oAuthAuthorizer`` to the consumer and token. Finally, I must
+actually apply the authorization to the ``HttpRequest``s I send out in the ``TweetStreamerActor``. Nothing could
+be simpler. I just add ``~> authorize`` to the ``HttpRequest`` I create when handling the ``query: String`` message.
 
+```scala
+class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with TweetMarshaller {
+  this: TwitterAuthorization =>
+  ...
+
+  def receive: Receive = {
+    case query: String =>
+      val body = HttpEntity(ContentType(MediaTypes.`application/x-www-form-urlencoded`), s"track=$query")
+      val rq = HttpRequest(HttpMethods.POST, uri = uri, entity = body) ~> authorize
+      sendTo(io).withResponsesReceivedBy(self)(rq)
+    ...
+  }
+}
+```
+
+To complete, I need to modify the test and the app to satisfy the self-type annotation. The test does not actually
+require any authorization:
+
+```scala
+class TweetStreamerActorSpec extends TestKit(ActorSystem()) with SpecificationLike with ImplicitSender {
+  sequential
+
+  val port = 12345
+  val tweetStream = TestActorRef(
+    new TweetStreamerActor(Uri(s"http://localhost:$port/"), testActor)
+    with TwitterAuthorization {
+      def authorize = identity
+    })
+
+  ...
+}
+```
+
+I must implement the ``authorize`` member, which returns ``HttpRequest => HttpRequest`` function. But for tests,
+the returned function makes no changes to its parameter; it is therefore the ``identity`` function.
+
+In the app, I mix in the ``OAuthTwitterAuthorization`` trait when constructing the ``TweetStreamerActor``.
+
+```scala
+object Main extends App {
+  import Commands._
+
+  val system = ActorSystem()
+  val sentiment = system.actorOf(Props(new SentimentAnalysisActor))
+  val stream = system.actorOf(Props(
+    new TweetStreamerActor(TweetStreamerActor.twitterUri, sentiment)
+    with OAuthTwitterAuthorization))
+  ...
+}
+```
+
+I now have code that successfully streams the tweets from Twitter's streaming API, I have OAuth authorization; the
+last component I need is the sentiment analysis.
+
+#Sentiment analysis
+The sentiment analysis receives the ``Tweet`` instances and should
