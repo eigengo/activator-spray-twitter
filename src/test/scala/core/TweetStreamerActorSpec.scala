@@ -14,9 +14,9 @@ class TweetStreamerActorSpec extends TestKit(ActorSystem()) with SpecificationLi
     def authorize = identity
   })
 
-  "Getting all 'typesafe' tweets" >> {
+  "Streaming tweets" >> {
 
-    "should receive the tweets" in {
+    "Should unmarshal one tweet" in {
       val twitterApi = TwitterApi(port)
       tweetStream ! "typesafe"
 

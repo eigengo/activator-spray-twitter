@@ -40,25 +40,27 @@ trait TweetMarshaller {
       }
     }
 
-    def mkPlace(place: JsValue): Option[Place] = place match {
+    def mkPlace(place: JsValue): Deserialized[Option[Place]] = place match {
       case JsObject(fields) =>
         (fields.get("country"), fields.get("name")) match {
-          case (Some(JsString(country)), Some(JsString(name))) => Some(Place(country, name))
-          case _                                               => None
+          case (Some(JsString(country)), Some(JsString(name))) => Right(Some(Place(country, name)))
+          case _                                               => Left(MalformedContent("bad place"))
         }
-      case _ => None
+      case JsNull => Right(None)
+      case _ => Left(MalformedContent("bad tweet"))
     }
 
     def apply(entity: HttpEntity): Deserialized[Tweet] = {
       Try {
         val json = JsonParser(entity.asString).asJsObject
-
         (json.fields.get("id_str"), json.fields.get("text"), json.fields.get("place"), json.fields.get("user")) match {
-          case (Some(JsString(id)), Some(JsString(text)), place, Some(user: JsObject)) =>
-            mkUser(user) match {
-              case Right(user) => Right(Tweet(id, user, text, place.flatMap(mkPlace)))
-              case Left(msg)   => Left(msg)
-            }
+          case (Some(JsString(id)), Some(JsString(text)), Some(place), Some(user: JsObject)) =>
+            val x = mkUser(user).fold(x => Left(x), { user =>
+              mkPlace(place).fold(x => Left(x), { place =>
+                Right(Tweet(id, user, text, place))
+              })
+            })
+            x
           case _ => Left(MalformedContent("bad tweet"))
         }
       }
@@ -76,15 +78,11 @@ class TweetStreamerActor(uri: Uri, processor: ActorRef) extends Actor with Tweet
 
   def receive: Receive = {
     case query: String =>
-      val post = HttpEntity(ContentType(MediaTypes.`application/x-www-form-urlencoded`), s"track=$query")
-      val rq = HttpRequest(HttpMethods.POST, uri = uri, entity = post) ~> authorize
+      val body = HttpEntity(ContentType(MediaTypes.`application/x-www-form-urlencoded`), s"track=$query")
+      val rq = HttpRequest(HttpMethods.POST, uri = uri, entity = body) ~> authorize
       sendTo(io).withResponsesReceivedBy(self)(rq)
     case ChunkedResponseStart(_) =>
-    case MessageChunk(entity, _) =>
-      TweetUnmarshaller(entity) match {
-        case Right(tweet) => processor ! tweet
-        case _            =>
-      }
+    case MessageChunk(entity, _) => TweetUnmarshaller(entity).fold(_ => (), processor !)
     case _ =>
   }
 }
