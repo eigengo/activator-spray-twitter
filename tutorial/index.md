@@ -55,7 +55,7 @@ object Main extends App {
 ---
 
 #Streaming the tweets
-Next up, let's write the core of the ``TweetStreamerActor``: We construct the Akka IO, and then construct
+Next up, let's write the core of the ``TweetStreamerActor``: We construct the Akka IO HTTP actor, and then construct
 the appropriate ``HttpRequest`` that we send to the given ``uri``.
 
 ```scala
