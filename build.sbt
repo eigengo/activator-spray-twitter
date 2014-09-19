@@ -6,7 +6,7 @@ scalaVersion := "2.10.2"
 
 resolvers += "spray repo" at "http://repo.spray.io"
 
-resolvers += "Sonatype snapshots" at "http://oss.sonatype.org/content/repositories/snapshots/"
+resolvers += "Sonatype snapshots" at "https://oss.sonatype.org/content/repositories/snapshots/"
 
 libraryDependencies ++= Seq(
   "com.typesafe.akka"      %% "akka-actor"            % "2.2.3",
